@@ -32,6 +32,9 @@ def load_league_data():
     settings = league.settings
     reg_season_limit = getattr(settings, "reg_season_count", 19)
 
+    # 1. שליפת השבוע הנוכחי המדויק
+    current_week = getattr(league, "currentMatchupPeriod", 1)
+
     team_rows = []
     matchup_rows = []
     player_rows = []
@@ -97,14 +100,40 @@ def load_league_data():
     df_matchups = pd.DataFrame(matchup_rows)
     df_players = pd.DataFrame(player_rows)
 
-    # סינון שבועות עתידיים שבהם לא שוחקו משחקים בכלל (לכל הליגה)
+    # --- 2. בניית טבלת ניצחונות הקטגוריות השבועית (Week Score Matrix) ---
+    score_records = []
+    for w in range(1, current_week + 1):
+        try:
+            boxes = league.box_scores(w)
+            for box in boxes:
+                h_name = box.home_team.team_name.strip()
+                a_name = box.away_team.team_name.strip()
+
+                h_cat_wins = int(getattr(box, 'home_wins', 0))
+                a_cat_wins = int(getattr(box, 'away_wins', 0))
+
+                score_records.append({"Week": f"Week {w}", "Team": h_name, "Category Wins": h_cat_wins})
+                score_records.append({"Week": f"Week {w}", "Team": a_name, "Category Wins": a_cat_wins})
+        except Exception as err:
+            pass
+
+    df_scores_raw = pd.DataFrame(score_records)
+    if not df_scores_raw.empty:
+        df_week_scores = df_scores_raw.pivot(index="Team", columns="Week", values="Category Wins").fillna(0).astype(int)
+        valid_cols = [f"Week {w}" for w in range(1, current_week + 1) if f"Week {w}" in df_week_scores.columns]
+        df_week_scores = df_week_scores[valid_cols]
+        df_week_scores.index.name = None
+        df_week_scores.columns.name = None
+    else:
+        df_week_scores = pd.DataFrame()
+
+    # סינון שבועות עתידיים ב-df_matchups
     if not df_matchups.empty:
         active_weeks = df_matchups.groupby("week").apply(
             lambda w: (w["team_score"].sum() > 0 or w["opponent_score"].sum() > 0)
         )
         valid_weeks = active_weeks[active_weeks].index.tolist()
 
-        # אם הליגה עוד לפני שבוע 1, נציג לפחות את שבוע 1 לבחירה
         if not valid_weeks:
             valid_weeks = [1]
 
@@ -135,9 +164,9 @@ def load_league_data():
         team_cat_totals[f"{cat}_score"] = (normalized * 9.0 + 1.0).clip(1.0, 9.6).round(1)
 
         def get_tier_color(rank):
-            if rank <= 3:
+            if rank <= 2:
                 return "#28a745"  # טופ 3 - ירוק
-            elif rank > num_teams - 3:
+            elif rank > num_teams - 2:
                 return "#dc3545"  # 3 אחרונות - אדום
             return "#6c757d"  # אמצע - אפור
 
@@ -145,7 +174,7 @@ def load_league_data():
 
     df_team_scores = team_cat_totals
 
-    return df_teams, df_matchups, df_players, df_team_scores
+    return df_teams, df_matchups, df_players, df_team_scores, current_week, df_week_scores
 
 
 # מילון צבעים קבוע לכל הקבוצות בליגה
@@ -168,6 +197,8 @@ if "df_teams" not in st.session_state:
     st.session_state["df_matchups"] = None
     st.session_state["df_players"] = None
     st.session_state["df_team_scores"] = None
+    st.session_state["current_week"] = 1
+    st.session_state["df_week_scores"] = None
 
 col_title, col_btn = st.columns([4, 1])
 with col_title:
@@ -176,25 +207,29 @@ with col_btn:
     st.write("")
     if st.button("🔄 Load / Refresh Data", use_container_width=True):
         with st.spinner("Fetching data from ESPN API..."):
-            df_t, df_m, df_p, df_s = load_league_data()
+            df_t, df_m, df_p, df_s, curr_w, df_ws = load_league_data()
             if df_t is not None and not df_t.empty:
                 df_t["color"] = df_t["team_name"].map(st.session_state["TEAM_COLORS"]).fillna("#333333")
             st.session_state["df_teams"] = df_t
             st.session_state["df_matchups"] = df_m
             st.session_state["df_players"] = df_p
             st.session_state["df_team_scores"] = df_s
+            st.session_state["current_week"] = curr_w
+            st.session_state["df_week_scores"] = df_ws
         st.success("Data loaded successfully!")
         st.rerun()
 
 if st.session_state["df_teams"] is None:
     try:
-        df_t, df_m, df_p, df_s = load_league_data()
+        df_t, df_m, df_p, df_s, curr_w, df_ws = load_league_data()
         if df_t is not None and not df_t.empty:
             df_t["color"] = df_t["team_name"].map(st.session_state["TEAM_COLORS"]).fillna("#333333")
         st.session_state["df_teams"] = df_t
         st.session_state["df_matchups"] = df_m
         st.session_state["df_players"] = df_p
         st.session_state["df_team_scores"] = df_s
+        st.session_state["current_week"] = curr_w
+        st.session_state["df_week_scores"] = df_ws
     except Exception as e:
         st.warning(f"Could not auto-load data yet. Please click 'Load / Refresh Data'. Error: {e}")
 
@@ -210,27 +245,23 @@ tabs = st.tabs(["Standing", "Roster", "Matchup","testing"])
 with tabs[0]:
     if st.session_state.get("df_teams") is not None and not st.session_state["df_teams"].empty:
         df_teams_raw = st.session_state["df_teams"].copy()
-        df_m = st.session_state.get("df_matchups", pd.DataFrame())
 
-        # שליפת מילון הצבעים מה-session_state
+        # ניקוי שמות
+        df_teams_raw["team_name"] = df_teams_raw["team_name"].astype(str).str.strip()
+
+        # שליפת מילון הצבעים מ-session_state
         team_colors = st.session_state.get("TEAM_COLORS", {})
 
-        # סינון משחקי פלייאוף עבור גרף העונה הסדירה
-        if not df_m.empty and 'is_playoff' in df_m.columns:
-            df_m_reg = df_m[df_m['is_playoff'] == False].copy()
-        else:
-            df_m_reg = df_m.copy()
 
-
-        # הכנת עמודת צבע ויזואלית (עיגול צבעוני HTML) לטבלה
+        # עיגול צבעוני ממורכז
         def make_color_circle(color_hex):
-            return f'<span style="color:{color_hex}; font-size: 26px;">●</span>'
+            return f'<div style="display: flex; justify-content: center; align-items: center;"><span style="color:{color_hex}; font-size: 22px; line-height: 1;">●</span></div>'
 
 
         df_teams_raw["Color_Hex"] = df_teams_raw["team_name"].map(team_colors).fillna("#333333")
         df_teams_raw["Color"] = df_teams_raw["Color_Hex"].apply(make_color_circle)
 
-        # מיון לפי עמודת standing הרשמית מ-ESPN API (1, 2, 3...)
+        # מיון לפי standing מ-ESPN
         df_sorted = (
             df_teams_raw
             .drop(columns=["team_id", "abbrev", "owner"], errors="ignore")
@@ -238,68 +269,179 @@ with tabs[0]:
             .reset_index(drop=True)
         )
 
-        # הוספת כתר וכדורסל למי שבמקום 1 הרשמי (או שוויון במקום הראשון לפי ניצחונות ותיקו)
+        # הוספת כתר וכדורסל למקום הראשון
         if not df_sorted.empty:
             min_standing = df_sorted["standing"].min()
 
 
             def add_first_place_icon(row):
                 if row["standing"] == min_standing:
-                    return f" {row['team_name']} 👑 🏀"
+                    return f"{row['team_name']} 👑 🏀"
                 return row["team_name"]
 
 
             df_sorted["team_name"] = df_sorted.apply(add_first_place_icon, axis=1)
 
-        # סדר העמודות בטבלה
-        cols_order = ["team_name", "wins", "losses", "ties", "standing", "Color"]
-        df_display = df_sorted[[col for col in cols_order if col in df_sorted.columns]]
+        # סדר העמודות ושינוי שמות
+        cols_order = ["team_name", "wins", "losses", "ties", "Color"]
+        df_display = df_sorted[[col for col in cols_order if col in df_sorted.columns]].copy()
+        df_display = df_display.rename(columns={
+            "team_name": "Team",
+            "wins": "Wins",
+            "losses": "Losses",
+            "ties": "Ties"
+        })
+
+        # מרכוז מלא של הטבלה
+        styled_df = (
+            df_display.style
+            .hide(axis="index")
+            .set_table_styles([
+                {'selector': 'th',
+                 'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important'),
+                           ('font-weight', 'bold')]},
+                {'selector': 'td',
+                 'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important')]}
+            ])
+        )
 
         teams_list = df_teams_raw["team_name"].unique().tolist()
 
-        # חלוקה לעמודות: שמאל = טבלה, ימין = גרף ניצחונות
+        # חלוקה לעמודות
         col_left, col_right = st.columns([1, 1])
 
         with col_left:
             st.markdown("<h3 style='text-align: center;'>Teams Table Regular Season</h3>", unsafe_allow_html=True)
-            st.write(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+            st.write(styled_df.to_html(escape=False), unsafe_allow_html=True)
+
+        selected_from_chart = None
 
         with col_right:
-            st.markdown("<h3 style='text-align: center;'>Weekly Wins Progression (Click on graph)</h3>",
+            st.markdown("<h3 style='text-align: center;'>Weekly Wins Progression (Click line)</h3>",
                         unsafe_allow_html=True)
 
-            if not df_m_reg.empty:
-                df_m_plot = df_m_reg.sort_values(["team_name", "week"])
-                week0 = pd.DataFrame({
-                    "week": [0] * len(teams_list),
-                    "team_name": teams_list,
-                    "win": [0] * len(teams_list)
-                })
-                df_plot = pd.concat([week0, df_m_plot], ignore_index=True)
-                df_plot["wins"] = df_plot.groupby("team_name")["win"].cumsum()
+            df_week_scores = st.session_state.get("df_week_scores")
+            curr_w = st.session_state.get("current_week", 1)
 
-                # יצירת דומיין וטווח צבעים עבור Altair
-                domain_teams = [t for t in teams_list if t in team_colors]
-                range_colors = [team_colors[t] for t in domain_teams]
+            if df_week_scores is not None and not df_week_scores.empty:
+                try:
+                    history_records = []
+                    for t in teams_list:
+                        history_records.append({"team_name": t, "week": 0, "weekly_cat_wins": 0})
 
-                selection = alt.selection_point(fields=['team_name'], on='click', name="team_select")
+                    for team_name in df_week_scores.index:
+                        for col in df_week_scores.columns:
+                            week_num = int(col.replace("Week ", "").strip())
+                            cat_wins = int(df_week_scores.loc[team_name, col])
+                            history_records.append({
+                                "team_name": team_name,
+                                "week": week_num,
+                                "weekly_cat_wins": cat_wins
+                            })
 
-                chart = alt.Chart(df_plot).mark_line().encode(
-                    x=alt.X('week:O', title='Week', axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y('wins:Q', title='Total Wins'),
-                    color=alt.Color(
-                        'team_name:N',
-                        scale=alt.Scale(domain=domain_teams, range=range_colors),
-                        legend=None
-                    ),
-                    opacity=alt.condition(selection, alt.value(1), alt.value(0.1)),
-                    strokeWidth=alt.condition(selection, alt.value(5), alt.value(1.5)),
-                    tooltip=['team_name', 'week', 'wins']
-                ).add_params(selection).properties(height=400)
+                    df_graph = pd.DataFrame(history_records)
 
-                st.altair_chart(chart, use_container_width=True)
+                    if not df_graph.empty:
+                        df_graph = df_graph.sort_values(['team_name', 'week'])
+                        df_graph['wins'] = df_graph.groupby('team_name')['weekly_cat_wins'].cumsum()
+
+                        domain_teams = [t for t in teams_list if t in team_colors]
+                        range_colors = [team_colors[t] for t in domain_teams]
+
+                        selection = alt.selection_point(fields=['team_name'], name="team_select")
+
+                        chart = alt.Chart(df_graph).mark_line(point=True).encode(
+                            x=alt.X('week:O', title='Week', axis=alt.Axis(labelAngle=0),
+                                    scale=alt.Scale(domain=list(range(0, curr_w + 1)))),
+                            y=alt.Y('wins:Q', title='Cumulative Category Wins', scale=alt.Scale(zero=True)),
+                            color=alt.Color('team_name:N', scale=alt.Scale(domain=domain_teams, range=range_colors),
+                                            legend=None),
+                            opacity=alt.condition(selection, alt.value(1.0), alt.value(0.2)),
+                            strokeWidth=alt.condition(selection, alt.value(4), alt.value(1.5)),
+                            tooltip=['team_name', 'week', alt.Tooltip('wins:Q', title='Total Cat Wins')]
+                        ).add_params(selection).properties(height=380)
+
+                        event = st.altair_chart(chart, use_container_width=True, on_select="rerun")
+
+                        if event and "selection" in event and "team_select" in event["selection"]:
+                            points = event["selection"]["team_select"]
+                            if points and len(points) > 0:
+                                selected_from_chart = points[0].get("team_name")
+
+                except Exception as e:
+                    st.error(f"Could not build graph: {e}")
             else:
-                st.info("No matchup history available yet for the graph.")
+                st.info("Please click 'Load / Refresh Data' to display the graph.")
+
+        # ----------------------------------------------------
+        # 🎯 פירוט 9 הקטגוריות לגובה (רק לפי לחיצה בגרף)
+        # ----------------------------------------------------
+        st.divider()
+        st.markdown("## 🔍 Detailed Category Breakdown & Total Rating")
+
+        # קביעת הקבוצה הנבחרת: לפי הלחיצה בלבד (או הראשונה ברשימה ברירת מחדל)
+        selected_team = selected_from_chart if (selected_from_chart and selected_from_chart in teams_list) else \
+        teams_list[0]
+        team_hex = team_colors.get(selected_team, "#1f77b4")
+
+        # הצגת שם הקבוצה המודגש בצבע שלה
+        st.markdown(
+            f"<h2 style='text-align: center; color: {team_hex}; background-color: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px; border: 2px solid {team_hex};'>"
+            f"● {selected_team}"
+            f"</h2>",
+            unsafe_allow_html=True
+        )
+
+        df_cat_scores = st.session_state.get("df_team_scores")
+
+        if df_cat_scores is not None and not df_cat_scores.empty:
+            categories = ["PTS", "REB", "AST", "STL", "BLK", "3PM", "FG%", "FT%", "TO"]
+
+            # צביעת הקבוצה הנבחרת בצבעה והשאר באפור
+            df_cat_scores['display_color'] = df_cat_scores['team_name'].apply(
+                lambda t: team_hex if t == selected_team else "#a6a6a6"
+            )
+
+            # --- 1. רשת 3x3 של 9 גרפים עומדים (ציר X = קבוצות, ציר Y = ערך הקטגוריה) ---
+            st.markdown("### 📊 9-Category Rankings")
+
+            for row_idx in range(0, 9, 3):
+                cols = st.columns(3)
+                for c_idx in range(3):
+                    cat_name = categories[row_idx + c_idx]
+                    with cols[c_idx]:
+                        # עבור TO נמוך זה טוב יותר (ascending=True), לשאר גבוה זה טוב יותר (ascending=False)
+                        asc = True if cat_name == "TO" else False
+                        df_sub = df_cat_scores.sort_values(by=cat_name, ascending=asc).copy()
+
+                        cat_chart = alt.Chart(df_sub).mark_bar().encode(
+                            x=alt.X('team_name:N', sort=None, title=None,
+                                    axis=alt.Axis(labelAngle=-45, labelLimit=100)),
+                            y=alt.Y(f'{cat_name}:Q', title=cat_name),
+                            color=alt.Color('display_color:N', scale=None),
+                            tooltip=['team_name', alt.Tooltip(f'{cat_name}:Q', format='.2f')]
+                        ).properties(title=f"Category: {cat_name}", height=280)
+
+                        st.altair_chart(cat_chart, use_container_width=True)
+
+            # --- 2. גרף שכלול כללי עומד ---
+            st.divider()
+            st.markdown("### 🏆 Overall League Power Ranking (Composite Score)")
+
+            score_cols = [f"{c}_score" for c in categories if f"{c}_score" in df_cat_scores.columns]
+            if score_cols:
+                df_cat_scores['total_composite_score'] = df_cat_scores[score_cols].mean(axis=1).round(2)
+                df_total = df_cat_scores.sort_values(by='total_composite_score', ascending=False).copy()
+
+                total_chart = alt.Chart(df_total).mark_bar().encode(
+                    x=alt.X('team_name:N', sort=None, title=None, axis=alt.Axis(labelAngle=-45, labelLimit=120)),
+                    y=alt.Y('total_composite_score:Q', title='Composite Power Rating (1.0 - 10.0)'),
+                    color=alt.Color('display_color:N', scale=None),
+                    tooltip=['team_name', alt.Tooltip('total_composite_score:Q', title='Power Score')]
+                ).properties(height=350)
+
+                st.altair_chart(total_chart, use_container_width=True)
+
     else:
         st.info("Please click the 'Load / Refresh Data' button above to load the league table.")
 # endregion
@@ -463,158 +605,238 @@ with tabs[1]:
 
 
 # ------------------------------------------
-# region SUB-REGION: TAB 2 - MATCHUP H2H
+# region SUB-REGION: TAB 2 - MATCHUP ANALYSIS
 # ------------------------------------------
 with tabs[2]:
-    st.markdown("<h3 style='text-align: center;'>Head-to-Head Weekly Matchup Analysis</h3>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>Head-to-Head Weekly Matchup Analysis</h2>", unsafe_allow_html=True)
 
-    if st.session_state.get("df_teams") is not None and not st.session_state.get("df_matchups", pd.DataFrame()).empty:
-        df_m = st.session_state["df_matchups"]
-        team_colors = st.session_state.get("TEAM_COLORS", {})
+    try:
+        league = build_league()
+        curr_w = st.session_state.get("current_week", getattr(league, "currentMatchupPeriod", 2))
 
-        # בחירת שבוע
-        available_weeks = sorted(df_m["week"].unique())
-        selected_week = st.selectbox("Select Week", available_weeks,
-                                     index=len(available_weeks) - 1 if available_weeks else 0)
+        # בחירת שבוע דינמית (משבוע 1 ועד השבוע האקטיבי)
+        weeks_list = list(range(1, curr_w + 1))
 
-        # סינון משחקים לשבוע הנבחר
-        df_week_matches = df_m[df_m["week"] == selected_week]
+        col_w, _ = st.columns([1, 2])
+        with col_w:
+            selected_week = st.selectbox("Select Week", weeks_list, index=len(weeks_list) - 1)
 
-        # יצירת רשימת קרבות ייחודית לשבוע (כדי להימנע מכפילויות של הבית/חוץ)
-        matchup_pairs = []
-        seen_pairs = set()
-        for _, row in df_week_matches.iterrows():
-            t1, t2 = row["team_name"], row["opponent_name"]
-            if t2 != "BYE" and tuple(sorted([t1, t2])) not in seen_pairs:
-                seen_pairs.add(tuple(sorted([t1, t2])))
-                matchup_pairs.append((t1, t2))
+        boxes = league.box_scores(selected_week)
 
-        if matchup_pairs:
-            matchup_labels = [f"{t1}  vs  {t2}" for t1, t2 in matchup_pairs]
-            selected_matchup_label = st.selectbox("Select Matchup", matchup_labels)
+        if boxes:
+            matchup_dict = {}
+            for box in boxes:
+                h_team = box.home_team.team_name.strip()
+                a_team = box.away_team.team_name.strip()
+                label = f"{h_team} vs {a_team}"
+                matchup_dict[label] = box
 
-            # חילוץ שתי הקבוצות הנבחרות
-            idx = matchup_labels.index(selected_matchup_label)
-            team_a, team_b = matchup_pairs[idx]
+            selected_matchup_label = st.selectbox("Select Matchup", list(matchup_dict.keys()))
 
-            color_a = team_colors.get(team_a, "#1f77b4")
-            color_b = team_colors.get(team_b, "#ff7f0e")
+            if selected_matchup_label:
+                box = matchup_dict[selected_matchup_label]
 
-            # --- חישוב סיכויי זכייה דינמיים והשוואת קטגוריות ---
-            categories = ["PTS", "REB", "AST", "STL", "BLK", "3PM", "FG%", "FT%", "TO"]
+                h_team = box.home_team.team_name.strip()
+                a_team = box.away_team.team_name.strip()
 
-            # שליפת שחקני שתי הקבוצות לצורך חישוב תחזית/חוזק
-            df_players = st.session_state.get("df_players", pd.DataFrame())
-            team_a_players = df_players[df_players["team_name"] == team_a] if not df_players.empty else pd.DataFrame()
-            team_b_players = df_players[df_players["team_name"] == team_b] if not df_players.empty else pd.DataFrame()
+                team_colors = st.session_state.get("TEAM_COLORS", {})
+                h_color = team_colors.get(h_team, "#1f77b4")
+                a_color = team_colors.get(a_team, "#e377c2")
 
-            # חישוב משוקלל לכל קבוצה לפי ממוצעי השחקנים (או ציוני הקטגוריות)
-            scores_a = {cat: team_a_players[cat].mean() if not team_a_players.empty and cat in team_a_players else 5.0
-                        for cat in categories}
-            scores_b = {cat: team_b_players[cat].mean() if not team_b_players.empty and cat in team_b_players else 5.0
-                        for cat in categories}
+                h_cat_wins = int(getattr(box, 'home_wins', 0))
+                a_cat_wins = int(getattr(box, 'away_wins', 0))
 
-            # חישוב סיכוי נצח משוער בהתבסס על יחס הנתונים המשוקלל
-            total_score_a = sum(scores_a.values()) if scores_a else 1
-            total_score_b = sum(scores_b.values()) if scores_b else 1
-            prob_a = round((total_score_a / (total_score_a + total_score_b)) * 100, 1)
-            prob_b = round(100 - prob_a, 1)
-
-            # --- תצוגה ראש בראש: צד ימין קבוצה א', צד שמאל קבוצה ב' ---
-            col_team1, col_win_prob, col_team2 = st.columns([2, 3, 2])
-
-            with col_team1:
-                st.markdown(f"<h2 style='text-align: center; color: {color_a};'>{team_a}</h2>", unsafe_allow_html=True)
-
-            with col_win_prob:
-                st.markdown("<h4 style='text-align: center;'>Win Probability (Live + Projections)</h4>",
-                            unsafe_allow_html=True)
-                st.markdown(f"""
-                    <div style='display: flex; justify-content: space-around; align-items: center; font-size: 20px; font-weight: bold;'>
-                        <span style='color: {color_a};'>{prob_a}%</span>
-                        <span>VS</span>
-                        <span style='color: {color_b};'>{prob_b}%</span>
-                    </div>
-                """, unsafe_allow_html=True)
-                st.progress(prob_a / 100.0)
-
-            with col_team2:
-                st.markdown(f"<h2 style='text-align: center; color: {color_b};'>{team_b}</h2>", unsafe_allow_html=True)
-
-            st.markdown("---")
-
-            # --- השוואת 9 הקטגוריות באמצע ---
-            st.markdown("<h4 style='text-align: center;'>9-Cat Breakdown</h4>", unsafe_allow_html=True)
-
-            for cat in categories:
-                val_a = scores_a.get(cat, 0.0)
-                val_b = scores_b.get(cat, 0.0)
-
-                c1, c_cat, c2 = st.columns([3, 2, 3])
+                st.markdown("<br>", unsafe_allow_html=True)
+                c1, c2, c3 = st.columns([2, 2, 2])
                 with c1:
-                    st.markdown(
-                        f"<div style='text-align: right; color: {color_a}; font-weight: bold;'>{val_a:.2f}</div>",
-                        unsafe_allow_html=True)
-                with c_cat:
-                    st.markdown(
-                        f"<div style='text-align: center; background-color: #f0f2f6; border-radius: 5px; font-weight: bold;'>{cat}</div>",
-                        unsafe_allow_html=True)
+                    st.markdown(f"<h2 style='text-align: center; color: {h_color};'>{h_team}</h2>",
+                                unsafe_allow_html=True)
                 with c2:
-                    st.markdown(
-                        f"<div style='text-align: left; color: {color_b}; font-weight: bold;'>{val_b:.2f}</div>",
-                        unsafe_allow_html=True)
+                    st.markdown(f"<h2 style='text-align: center;'>{h_cat_wins} - {a_cat_wins}</h2>",
+                                unsafe_allow_html=True)
+                    st.markdown("<p style='text-align: center; color: #888;'>Category Wins</p>", unsafe_allow_html=True)
+                with c3:
+                    st.markdown(f"<h2 style='text-align: center; color: {a_color};'>{a_team}</h2>",
+                                unsafe_allow_html=True)
+
+                st.divider()
+                st.markdown("<h3 style='text-align: center;'>9-Cat Live Breakdown</h3>", unsafe_allow_html=True)
+
+                h_stats = getattr(box, 'home_stats', {}) or {}
+                a_stats = getattr(box, 'away_stats', {}) or {}
+
+                categories = ["PTS", "REB", "AST", "STL", "BLK", "3PM", "FG%", "FT%", "TO"]
+                breakdown_rows = []
+
+                for cat in categories:
+                    h_raw = h_stats.get(cat, {}).get('value', 0) if isinstance(h_stats.get(cat), dict) else h_stats.get(
+                        cat, 0)
+                    a_raw = a_stats.get(cat, {}).get('value', 0) if isinstance(a_stats.get(cat), dict) else a_stats.get(
+                        cat, 0)
+
+                    h_val = float(h_raw)
+                    a_val = float(a_raw)
+
+                    if cat in ["FG%", "FT%"]:
+                        h_str = f"{h_val:.3f}"
+                        a_str = f"{a_val:.3f}"
+                    else:
+                        h_str = f"{int(h_val)}" if h_val.is_integer() else f"{h_val:.1f}"
+                        a_str = f"{int(a_val)}" if a_val.is_integer() else f"{a_val:.1f}"
+
+                    if cat == "TO":
+                        h_lead = h_val < a_val and h_val > 0
+                        a_lead = a_val < h_val and a_val > 0
+                    else:
+                        h_lead = h_val > a_val
+                        a_lead = a_val > h_val
+
+                    # עיצוב ללא אימוג'י - רק צבע והדגשה במידה ומוביל
+                    h_style = f"color: {h_color}; font-weight: bold; text-align: center;" if h_lead else "text-align: center; color: #666;"
+                    a_style = f"color: {a_color}; font-weight: bold; text-align: center;" if a_lead else "text-align: center; color: #666;"
+
+                    breakdown_rows.append({
+                        h_team: f"<span style='{h_style}'>{h_str}</span>",
+                        "Category": f"<b>{cat}</b>",
+                        a_team: f"<span style='{a_style}'>{a_str}</span>"
+                    })
+
+                df_bd = pd.DataFrame(breakdown_rows)
+
+                # עיצוב ומרכוז מלא של הטבלה למרכז הדף
+                styled_bd = (
+                    df_bd.style
+                    .hide(axis="index")
+                    .set_table_styles([
+                        {'selector': 'th',
+                         'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important'),
+                                   ('font-weight', 'bold')]},
+                        {'selector': 'td',
+                         'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important')]}
+                    ])
+                )
+
+                # עטיפה ב-div ממורכז במרכז המסך
+                st.markdown(
+                    f"<div style='display: flex; justify-content: center; width: 100%;'>{styled_bd.to_html(escape=False)}</div>",
+                    unsafe_allow_html=True
+                )
+
         else:
-            st.info("No matchups found for this week.")
-    else:
-        st.info("Please load league data first using the sidebar or refresh button.")
+            st.info(f"No matchups found for Week {selected_week}.")
+
+    except Exception as e:
+        st.error(f"Could not load Matchup Analysis: {e}")
+
 # endregion
 
 
 # ------------------------------------------
-# region SUB-REGION: TAB 3 - TESTING
+# region TAB 3 - LIVE MATCHUPS DETAILED BREAKDOWN
 # ------------------------------------------
 with tabs[3]:
-    st.subheader("🧪 API & Data Structure Testing")
+    st.markdown("## ⚔️ Live Matchups Detailed 9-Cat Breakdown")
+    st.write("תוצאות עומק בלייב לפי 9 קטגוריות עבור השבוע הפעיל הנוכחי.")
 
-    df_p = st.session_state.get("df_players")
-    df_m = st.session_state.get("df_matchups")
+    try:
+        league = build_league()
+        curr_w = st.session_state.get("current_week", getattr(league, "currentMatchupPeriod", 2))
 
-    # 1. בדיקת נתוני מצ'אפים וקרבות
-    st.markdown("### 🏆 Matchups Raw Data Inspection")
-    if df_m is not None and not df_m.empty:
-        st.success(f"Matchups data loaded successfully! Total rows: {len(df_m)}")
+        st.info(f"📌 מציג פירוט קטגוריות בלייב עבור **Week {curr_w}**")
 
-        # בחירת שבוע לבדיקה
-        test_weeks = sorted(df_m["week"].unique()) if "week" in df_m.columns else []
-        if test_weeks:
-            inspect_week = st.selectbox("Select Week to Inspect Matchups:", test_weeks, key="test_week_select")
-            week_data = df_m[df_m["week"] == inspect_week]
-            st.write(f"**Matchups for Week {inspect_week}:**")
-            st.dataframe(week_data, use_container_width=True)
+        boxes = league.box_scores(curr_w)
+        categories = ["PTS", "REB", "AST", "STL", "BLK", "3PM", "FG%", "FT%", "TO"]
 
-        with st.expander("View Full Raw Matchups DataFrame"):
-            st.dataframe(df_m, use_container_width=True)
-    else:
-        st.warning("No matchups data found in `df_matchups`. Make sure to load league data.")
+        if boxes:
+            for idx, box in enumerate(boxes, start=1):
+                h_team = box.home_team.team_name.strip()
+                a_team = box.away_team.team_name.strip()
 
-    st.markdown("---")
+                h_cat_wins = int(getattr(box, 'home_wins', 0))
+                a_cat_wins = int(getattr(box, 'away_wins', 0))
+                ties = 9 - (h_cat_wins + a_cat_wins)
 
-    # 2. בדיקת נתוני שחקנים
-    st.markdown("### 🏀 Players Raw Data Inspection")
-    if df_p is not None and not df_p.empty:
-        st.write("Here you can inspect the raw data structure returned by the ESPN API for players:")
+                # כותרת למאצ'אפ כולל תוצאה כללית
+                st.markdown(
+                    f"### 🏀 Matchup {idx}: {h_team} ({h_cat_wins}) vs ({a_cat_wins}) {a_team}"
+                )
 
-        player_names = df_p["player_name"].unique().tolist()
-        selected_player = st.selectbox("Select a player to inspect stats structure:", player_names,
-                                       key="test_player_select")
+                # שליפת נתוני 9 הקטגוריות בלייב מתוך אובייקט ה-box
+                h_stats = getattr(box, 'home_stats', {}) or {}
+                a_stats = getattr(box, 'away_stats', {}) or {}
 
-        if selected_player:
-            player_row = df_p[df_p["player_name"] == selected_player].iloc[0]
-            st.write(f"**Player:** {player_row['player_name']} ({player_row['position']})")
-            st.write("**Raw Stats Object / Dictionary:**")
-            st.json(player_row["raw_stats"])
-    else:
-        st.info("Please load league data first.")
+                rows = []
+                for cat in categories:
+                    # שליפת הערך של הקבוצה הביתית והאורחת
+                    h_val = h_stats.get(cat, {}).get('value', 0) if isinstance(h_stats.get(cat), dict) else h_stats.get(cat, 0)
+                    a_val = a_stats.get(cat, {}).get('value', 0) if isinstance(a_stats.get(cat), dict) else a_stats.get(cat, 0)
+
+                    # עיגול אחוזים ל-3 ספרות ושאר הסטטיסטיקות ל-1/0 ספרות
+                    if cat in ["FG%", "FT%"]:
+                        h_str = f"{float(h_val):.3f}"
+                        a_str = f"{float(a_val):.3f}"
+                    else:
+                        h_str = f"{float(h_val):.1f}".rstrip('0').rstrip('.')
+                        a_str = f"{float(a_val):.1f}".rstrip('0').rstrip('.')
+
+                    # סימון מוביל בקטגוריה (ב-TO נמוך זה מוביל)
+                    if cat == "TO":
+                        h_win = float(h_val) < float(a_val)
+                        a_win = float(a_val) < float(h_val)
+                    else:
+                        h_win = float(h_val) > float(a_val)
+                        a_win = float(a_val) > float(h_val)
+
+                    h_disp = f"<b>{h_str} 👈</b>" if h_win else h_str
+                    a_disp = f"<b>👉 {a_str}</b>" if a_win else a_str
+
+                    rows.append({
+                        "Category": cat,
+                        h_team: h_disp,
+                        a_team: a_disp
+                    })
+
+                df_matchup_detail = pd.DataFrame(rows)
+
+                # עיצוב ומרכוז הטבלה
+                styled_detail = (
+                    df_matchup_detail.style
+                    .hide(axis="index")
+                    .set_table_styles([
+                        {'selector': 'th', 'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important'), ('font-weight', 'bold')]},
+                        {'selector': 'td', 'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important')]}
+                    ])
+                )
+
+                st.write(styled_detail.to_html(escape=False), unsafe_allow_html=True)
+                st.markdown("<br>", unsafe_allow_html=True)
+
+        else:
+            st.info("No box scores found for current week.")
+
+        st.divider()
+
+        # ----------------------------------------------------
+        # טבלת Week Score Matrix
+        # ----------------------------------------------------
+        st.markdown("### 📊 Week Score Matrix (Category Wins per Team)")
+        df_week_scores = st.session_state.get("df_week_scores")
+
+        if df_week_scores is not None and not df_week_scores.empty:
+            styled_pivot = (
+                df_week_scores.style
+                .set_table_styles([
+                    {'selector': 'th', 'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important'), ('font-weight', 'bold')]},
+                    {'selector': 'td', 'props': [('text-align', 'center !important'), ('vertical-align', 'middle !important')]}
+                ])
+            )
+            st.write(styled_pivot.to_html(escape=False), unsafe_allow_html=True)
+        else:
+            st.info("No score data available. Please click 'Load / Refresh Data' above.")
+
+    except Exception as e:
+        st.error(f"Error loading Live Matchup details: {e}")
+
 # endregion
 
 
